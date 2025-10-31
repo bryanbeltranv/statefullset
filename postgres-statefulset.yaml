@@ -1,0 +1,326 @@
+---
+# ====================================================================================
+# ConfigMap: Almacena configuración no sensible de PostgreSQL
+# ====================================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+data:
+  POSTGRES_DB: mydb                                    # Nombre de la base de datos a crear
+  POSTGRES_USER: postgres                              # Usuario administrador de PostgreSQL
+  PGDATA: /var/lib/postgresql/data/pgdata             # Ruta donde se almacenan los datos de PostgreSQL
+
+---
+# ====================================================================================
+# Secret: Almacena contraseñas de forma segura (codificadas en base64)
+# ====================================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: "mypassword"                      # Contraseña del usuario principal
+  REPLICATION_PASSWORD: "replicapassword"              # Contraseña para el usuario de replicación
+
+---
+# ====================================================================================
+# Service MAESTRO: Servicio headless para acceder al nodo de escritura (postgres-0)
+# - clusterIP: None = Servicio headless (sin load balancing)
+# - Permite DNS estable: postgres-0.postgres-master
+# ====================================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-master
+  labels:
+    app: postgres
+    role: master
+spec:
+  ports:
+  - port: 5432                                         # Puerto de PostgreSQL
+    targetPort: 5432
+    name: postgres
+  clusterIP: None                                      # Headless service - No load balancing
+  selector:
+    app: postgres
+    role: master                                       # Solo selecciona pods con role=master
+
+---
+# ====================================================================================
+# Service RÉPLICAS: Servicio headless para nodos de lectura
+# ====================================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-replica
+  labels:
+    app: postgres
+    role: replica
+spec:
+  ports:
+  - port: 5432
+    targetPort: 5432
+    name: postgres
+  selector:
+    app: postgres
+    role: replica                                      # Solo selecciona pods con role=replica
+
+---
+# ====================================================================================
+# Service LECTURA: Balancea tráfico de lectura entre las réplicas
+# - Usar este servicio para operaciones de solo lectura (SELECT)
+# ====================================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-read
+  labels:
+    app: postgres
+spec:
+  ports:
+  - port: 5432
+    targetPort: 5432
+    name: postgres
+  selector:
+    app: postgres
+    role: replica                                      # Balancea entre todos los pods réplica
+  type: ClusterIP                                      # Servicio interno del cluster
+
+---
+# ====================================================================================
+# StatefulSet: Despliega PostgreSQL con replicación
+# - Pod 0 (postgres-0): MAESTRO - Acepta lecturas y escrituras
+# - Pod 1-2 (postgres-1, postgres-2): RÉPLICAS - Solo lectura
+# ====================================================================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+spec:
+  serviceName: postgres-master                         # Asocia con el servicio headless
+  replicas: 3                                          # 1 maestro + 2 réplicas
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      # ================================================================================
+      # Init Container: Se ejecuta ANTES del contenedor principal
+      # - Determina si el pod será maestro (0) o réplica (1-2)
+      # - Crea un archivo con el rol para que el contenedor principal lo lea
+      # ================================================================================
+      initContainers:
+      - name: init-postgres
+        image: postgres:15-alpine
+        command:
+        - bash
+        - "-c"
+        - |
+          set -ex  # Exit on error, print commands
+
+          # Extraer el número ordinal del nombre del pod (postgres-0, postgres-1, etc.)
+          # El StatefulSet garantiza nombres predecibles
+          [[ $(hostname) =~ -([0-9]+)$ ]] || exit 1
+          ordinal=${BASH_REMATCH[1]}
+
+          # Crear directorio de datos si no existe
+          mkdir -p /var/lib/postgresql/data/pgdata
+
+          # Determinar el rol basado en el número ordinal
+          # Pod 0 = MAESTRO (escritura y lectura)
+          # Pods 1+ = RÉPLICAS (solo lectura)
+          if [[ $ordinal -eq 0 ]]; then
+            echo "master" > /var/lib/postgresql/data/role
+            echo "Inicializando nodo MAESTRO (escritura)"
+          else
+            echo "replica" > /var/lib/postgresql/data/role
+            echo "Inicializando nodo REPLICA (lectura)"
+          fi
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+
+      # ================================================================================
+      # Contenedor Principal: PostgreSQL
+      # ================================================================================
+      containers:
+      - name: postgres
+        image: postgres:15-alpine                      # Imagen oficial de PostgreSQL
+        ports:
+        - containerPort: 5432
+          name: postgres
+
+        # Variables de entorno para configurar PostgreSQL
+        env:
+        - name: POSTGRES_DB
+          valueFrom:
+            configMapKeyRef:
+              name: postgres-config
+              key: POSTGRES_DB
+        - name: POSTGRES_USER
+          valueFrom:
+            configMapKeyRef:
+              name: postgres-config
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD                      # Contraseña del usuario admin
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: POSTGRES_PASSWORD
+        - name: PGDATA                                 # Directorio de datos
+          valueFrom:
+            configMapKeyRef:
+              name: postgres-config
+              key: PGDATA
+        - name: REPLICATION_PASSWORD                   # Contraseña para replicación
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: REPLICATION_PASSWORD
+        - name: POD_NAME                               # Nombre del pod actual
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+
+        # ============================================================================
+        # Lifecycle Hook: PostStart
+        # Se ejecuta DESPUÉS de que el contenedor inicia pero ANTES de estar "Ready"
+        # Configura la replicación según el rol (maestro o réplica)
+        # ============================================================================
+        lifecycle:
+          postStart:
+            exec:
+              command:
+              - bash
+              - "-c"
+              - |
+                set -ex
+
+                # Esperar a que PostgreSQL esté completamente iniciado
+                until pg_isready -U postgres; do
+                  sleep 2
+                done
+
+                # Leer el rol que fue definido por el initContainer
+                ROLE=$(cat /var/lib/postgresql/data/role)
+
+                # ====================================================================
+                # CONFIGURACIÓN DEL NODO MAESTRO
+                # ====================================================================
+                if [[ "$ROLE" == "master" ]]; then
+                  echo "Configurando nodo MAESTRO"
+
+                  # Crear usuario especial para replicación
+                  # Este usuario será usado por las réplicas para conectarse y replicar
+                  psql -U postgres -c "CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD '$REPLICATION_PASSWORD';" || true
+
+                  # Configurar pg_hba.conf: Define quién puede conectarse
+                  # - Primera línea: Permite replicación desde cualquier IP
+                  # - Segunda línea: Permite conexiones normales desde cualquier IP
+                  echo "host replication replicator 0.0.0.0/0 md5" >> $PGDATA/pg_hba.conf
+                  echo "host all all 0.0.0.0/0 md5" >> $PGDATA/pg_hba.conf
+
+                  # Configurar postgresql.conf: Parámetros de replicación
+                  cat >> $PGDATA/postgresql.conf <<EOF
+                  wal_level = replica                # Nivel de detalle en los WAL logs (Write-Ahead Logs)
+                  max_wal_senders = 10               # Máximo de procesos enviando WAL a réplicas
+                  max_replication_slots = 10         # Máximo de slots de replicación
+                  hot_standby = on                   # Permite consultas en réplicas
+                  EOF
+
+                  # Recargar la configuración sin reiniciar PostgreSQL
+                  psql -U postgres -c "SELECT pg_reload_conf();"
+
+                  # Etiquetar el pod como maestro (para los selectores de Service)
+                  kubectl label pod $POD_NAME role=master --overwrite || true
+
+                # ====================================================================
+                # CONFIGURACIÓN DE NODOS RÉPLICA
+                # ====================================================================
+                elif [[ "$ROLE" == "replica" ]]; then
+                  echo "Configurando nodo REPLICA"
+
+                  # Detener PostgreSQL para poder reemplazar los datos
+                  pg_ctl -D $PGDATA stop -m fast || true
+
+                  # Limpiar cualquier dato existente
+                  rm -rf $PGDATA/*
+
+                  # pg_basebackup: Clonar datos del maestro
+                  # - Conecta a postgres-0.postgres-master (nombre DNS del maestro)
+                  # - Usa el usuario 'replicator' creado en el maestro
+                  # - Copia todos los datos y configura automáticamente la replicación
+                  # - Reintenta hasta que el maestro esté disponible
+                  until PGPASSWORD=$REPLICATION_PASSWORD pg_basebackup -h postgres-0.postgres-master -D $PGDATA -U replicator -v -P -R; do
+                    echo "Esperando al maestro..."
+                    sleep 5
+                  done
+
+                  # Configuración adicional para standby (réplica)
+                  cat >> $PGDATA/postgresql.conf <<EOF
+                  hot_standby = on                   # Permite consultas SELECT mientras replica
+                  primary_conninfo = 'host=postgres-0.postgres-master port=5432 user=replicator password=$REPLICATION_PASSWORD'
+                  EOF
+
+                  # standby.signal: Indica a PostgreSQL que este es un servidor en standby
+                  touch $PGDATA/standby.signal
+
+                  # Reiniciar PostgreSQL en modo réplica
+                  pg_ctl -D $PGDATA -o "-c listen_addresses='*'" start
+
+                  # Etiquetar el pod como réplica (para los selectores de Service)
+                  kubectl label pod $POD_NAME role=replica --overwrite || true
+                fi
+
+        # Montar el volumen persistente
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+
+        # ============================================================================
+        # ReadinessProbe: Determina si el pod está listo para recibir tráfico
+        # Kubernetes no enviará tráfico hasta que esta prueba pase
+        # ============================================================================
+        readinessProbe:
+          exec:
+            command:
+            - bash
+            - "-c"
+            - pg_isready -U postgres                   # Verifica si PostgreSQL acepta conexiones
+          initialDelaySeconds: 30                      # Esperar 30s antes de la primera prueba
+          periodSeconds: 10                            # Verificar cada 10 segundos
+
+        # ============================================================================
+        # LivenessProbe: Determina si el pod está "vivo" y funcionando
+        # Si falla, Kubernetes reiniciará el contenedor
+        # ============================================================================
+        livenessProbe:
+          exec:
+            command:
+            - bash
+            - "-c"
+            - pg_isready -U postgres
+          initialDelaySeconds: 60                      # Esperar 60s antes de la primera prueba
+          periodSeconds: 20                            # Verificar cada 20 segundos
+
+  # ==================================================================================
+  # VolumeClaimTemplates: Plantilla para crear PersistentVolumeClaims
+  # - Cada pod del StatefulSet obtiene su propio volumen persistente
+  # - Los datos persisten aunque el pod se elimine
+  # - postgres-0 tendrá postgres-data-postgres-0
+  # - postgres-1 tendrá postgres-data-postgres-1
+  # - postgres-2 tendrá postgres-data-postgres-2
+  # ==================================================================================
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: [ "ReadWriteOnce" ]                 # Solo un nodo puede escribir
+      resources:
+        requests:
+          storage: 10Gi                                # 10GB por cada pod
