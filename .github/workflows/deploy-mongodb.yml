@@ -1,0 +1,90 @@
+name: Deploy MongoDB to OpenShift
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      replicas:
+        description: 'Number of replicas'
+        required: false
+        default: '2'
+
+env:
+  HELM_RELEASE_NAME: my-mongodb
+  NAMESPACE: bryan-beltran-dev
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install OpenShift CLI
+        run: |
+          echo "Installing OpenShift CLI..."
+          curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+          tar -xzf openshift-client-linux.tar.gz
+          sudo mv oc /usr/local/bin/
+          sudo chmod +x /usr/local/bin/oc
+          oc version --client
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.13.0'
+
+      - name: Login to OpenShift
+        run: |
+          echo "Logging into OpenShift..."
+          oc login --token=${{ secrets.OPENSHIFT_TOKEN }} \
+                   --server=${{ secrets.OPENSHIFT_SERVER }} \
+                   --insecure-skip-tls-verify=true
+          oc project ${{ env.NAMESPACE }}
+          echo "Current user: $(oc whoami)"
+          echo "Current project: $(oc project -q)"
+
+      - name: Deploy MongoDB with Helm
+        run: |
+          echo "Deploying MongoDB..."
+          REPLICAS=${{ github.event.inputs.replicas || '2' }}
+          
+          helm upgrade --install ${{ env.HELM_RELEASE_NAME }} \
+            oci://registry-1.docker.io/cloudpirates/mongodb \
+            --namespace ${{ env.NAMESPACE }} \
+            --set replicaCount=${REPLICAS} \
+            --values helm/mongodb-values.yaml \
+            --wait \
+            --timeout 10m \
+            --atomic
+
+      - name: Verify deployment
+        if: always()
+        run: |
+          echo "=== Helm Release Status ==="
+          helm status ${{ env.HELM_RELEASE_NAME }} -n ${{ env.NAMESPACE }}
+          
+          echo ""
+          echo "=== Pods ==="
+          oc get pods -l app=mongodb -n ${{ env.NAMESPACE }}
+          
+          echo ""
+          echo "=== Services ==="
+          oc get svc -l app=mongodb -n ${{ env.NAMESPACE }}
+          
+          echo ""
+          echo "=== Persistent Volume Claims ==="
+          oc get pvc -n ${{ env.NAMESPACE }}
+
+      - name: Wait for pods to be ready
+        run: |
+          echo "Waiting for MongoDB pods to be ready..."
+          oc wait --for=condition=ready pod \
+            -l app=mongodb \
+            -n ${{ env.NAMESPACE }} \
+            --timeout=300s
+          
+          echo "✅ Deployment successful!"

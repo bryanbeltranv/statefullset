@@ -1,0 +1,20 @@
+# Número de réplicas de MongoDB
+replicaCount: 2
+
+# Recursos para los pods
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+# Configuración de persistencia
+persistence:
+  enabled: true
+  size: 8Gi
+
+# Configuración de autenticación
+auth:
+  enabled: true
